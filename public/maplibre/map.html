@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <link rel="stylesheet" href="./maplibre-gl.min.css" />
+  <style>
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      overflow: hidden; background: #d9e2ec; font-family: Tahoma, sans-serif;
+    }
+    #map { position: absolute; inset: 0; }
+    #hud {
+      position: absolute; left: 8px; right: 8px; top: 8px; z-index: 20;
+      background: rgba(0,0,0,0.78); color: #7CFFB2; padding: 8px 10px;
+      border-radius: 8px; font-size: 11px; line-height: 1.45;
+      direction: ltr; max-height: 36%; overflow: auto;
+      display: none;
+    }
+    #hud.on { display: block; }
+    #status {
+      position: absolute; left: 12px; right: 12px; bottom: 12px; z-index: 10;
+      background: rgba(39,50,71,0.94); color: #fff; padding: 12px 14px;
+      border-radius: 12px; direction: rtl; text-align: right; line-height: 1.6;
+      display: none; font-size: 13px;
+    }
+    #status.show { display: block; }
+    #status code {
+      direction: ltr; display: block; margin-top: 8px; font-size: 11px;
+      opacity: 0.85; word-break: break-all;
+    }
+    .endpoint {
+      width: 14px; height: 14px; border-radius: 7px; border: 2px solid #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,.25);
+    }
+  </style>
+  <script src="./maplibre-gl.min.js"></script>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="hud"></div>
+  <div id="status"></div>
+  <script>
+    (function () {
+      if (location.protocol === 'file:') {
+        document.body.innerHTML = '<div style="padding:24px;direction:rtl">با file:// باز نکنید</div>';
+        return;
+      }
+
+      var qs = new URLSearchParams(location.search);
+      var DEBUG = qs.get('debug') === '1' || qs.get('embed') === '1';
+      var hud = document.getElementById('hud');
+      var statusEl = document.getElementById('status');
+      var hudLines = [];
+      if (DEBUG) hud.className = 'on';
+
+      var map = null;
+      var requestMarkers = [];
+      var selectedMarker = null;
+      var initInFlight = false;
+
+      function hudLog(msg) {
+        var line = new Date().toISOString().slice(11, 19) + ' ' + msg;
+        hudLines.unshift(line);
+        if (hudLines.length > 30) hudLines.pop();
+        if (DEBUG) hud.textContent = hudLines.join('\n');
+        post({ type: 'debug', step: msg });
+        post({ type: 'log', message: msg });
+      }
+
+      function showStatus(title, detail) {
+        statusEl.className = 'show';
+        statusEl.innerHTML = '<strong>' + title + '</strong>' +
+          (detail ? '<code>' + detail + '</code>' : '');
+      }
+
+      function hideStatus() {
+        statusEl.className = '';
+        statusEl.innerHTML = '';
+      }
+
+      function post(payload) {
+        try {
+          if (window.ReactNativeWebView) {
+            window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+          }
+        } catch (e) {}
+        if (payload.type === 'error') {
+          showStatus('خطا', payload.message);
+        }
+      }
+
+      window.onerror = function (msg, src, line) {
+        hudLog('JS_ERROR ' + msg + ' @' + line);
+        post({ type: 'error', message: String(msg) + ' @' + line });
+        return false;
+      };
+
+      function withTileKey(url, key) {
+        if (!url || !key || url.indexOf('key=') >= 0) return url;
+        if (url.indexOf('geo.sabzevar.ir') === -1) return url;
+        return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'key=' + key;
+      }
+
+      function viaProxy(url, proxyOrigin) {
+        if (!proxyOrigin || !url || url.indexOf('geo.sabzevar.ir') === -1) return url;
+        return proxyOrigin + '/map-proxy?url=' + encodeURIComponent(url);
+      }
+
+      function rewrite(url, resourceType, key, proxyOrigin) {
+        var next = url;
+        if (
+          resourceType === 'Tile' || resourceType === 'Source' ||
+          resourceType === 'Glyphs' || resourceType === 'SpriteImage' ||
+          resourceType === 'SpriteJSON' || resourceType === 'Style'
+        ) {
+          next = withTileKey(next, key);
+        }
+        return viaProxy(next, proxyOrigin);
+      }
+
+      function clearRequestMarkers() {
+        requestMarkers.forEach(function (m) { m.remove(); });
+        requestMarkers = [];
+      }
+
+      window.__mapBridge = {
+        setRequests: function (items) {
+          if (!map || !window.maplibregl) return;
+          clearRequestMarkers();
+          (items || []).forEach(function (item) {
+            if (item.latitude == null || item.longitude == null) return;
+            var el = document.createElement('div');
+            el.style.cssText = 'width:22px;height:30px;background:#E74C3C;border-radius:50% 50% 50% 0;transform:rotate(-45deg);border:2px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.3)';
+            var marker = new maplibregl.Marker({ element: el, anchor: 'bottom' })
+              .setLngLat([item.longitude, item.latitude]).addTo(map);
+            el.addEventListener('click', function (ev) {
+              ev.stopPropagation();
+              post({ type: 'requestPress', requestId: item.id });
+            });
+            requestMarkers.push(marker);
+          });
+        },
+        setSelected: function (coord) {
+          if (!map || !window.maplibregl) return;
+          if (selectedMarker) { selectedMarker.remove(); selectedMarker = null; }
+          if (!coord) return;
+          var el = document.createElement('div');
+          el.className = 'endpoint';
+          el.style.background = '#48DDB0';
+          selectedMarker = new maplibregl.Marker({ element: el })
+            .setLngLat([coord.longitude, coord.latitude]).addTo(map);
+        },
+        animateTo: function (region) {
+          if (!map) return;
+          var z = Math.min(18, Math.max(11, Math.round(Math.log2(360 / Math.max(region.latitudeDelta || 0.04, 0.002)))));
+          map.flyTo({
+            center: [region.longitude, region.latitude],
+            zoom: z, duration: 1000,
+            pitch: region.pitch != null ? region.pitch : 60
+          });
+        },
+        resize: function () {
+          if (map) { try { map.resize(); } catch (e) {} }
+        }
+      };
+
+      window.__initSabzevarMap = function (config) {
+        if (initInFlight) {
+          hudLog('init skipped (in flight)');
+          return;
+        }
+        initInFlight = true;
+        hudLog('init start');
+
+        var settled = false;
+        var watchdog = null;
+
+        function fail(message) {
+          if (settled) return;
+          settled = true;
+          initInFlight = false;
+          if (watchdog) clearTimeout(watchdog);
+          hudLog('FAIL ' + message);
+          post({ type: 'error', message: message });
+          post({ type: 'loading', value: false });
+        }
+
+        function ok(reason) {
+          if (settled) return;
+          settled = true;
+          initInFlight = false;
+          if (watchdog) clearTimeout(watchdog);
+          hudLog('OK via ' + reason);
+          post({ type: 'styleLoaded' });
+          post({ type: 'ready' });
+          post({ type: 'loading', value: false });
+          hideStatus();
+          setTimeout(function () { if (map) map.resize(); }, 50);
+          setTimeout(function () { if (map) map.resize(); }, 400);
+        }
+
+        try {
+          if (!window.maplibregl) {
+            fail('MapLibre JS missing');
+            return;
+          }
+          hudLog('maplibre=' + (maplibregl.version || 'ok'));
+
+          if (map) { map.remove(); map = null; }
+
+          var key = config.tileApiKey || '';
+          var proxyOrigin = config.proxyOrigin || location.origin;
+          var styleUrl = rewrite(config.styleUrl, 'Style', key, proxyOrigin);
+
+          hudLog('proxyOrigin=' + proxyOrigin);
+          hudLog('styleUrl=' + styleUrl);
+          post({ type: 'loading', value: true });
+          showStatus('در حال بارگذاری...', styleUrl);
+
+          watchdog = setTimeout(function () {
+            fail('timeout ' + ((config.timeoutMs || 120000) / 1000) + 's — style/tiles did not load: ' + styleUrl);
+          }, config.timeoutMs || 120000);
+
+          var canvas = document.createElement('canvas');
+          var gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+          hudLog(gl ? 'webgl=yes' : 'webgl=NO');
+          if (!gl) {
+            fail('WebGL unavailable in this WebView');
+            return;
+          }
+
+          hudLog('fetch style...');
+          fetch(styleUrl, { method: 'GET', cache: 'no-store' })
+            .then(function (res) {
+              hudLog('style HTTP ' + res.status);
+              if (!res.ok) {
+                return res.text().then(function (body) {
+                  throw new Error('HTTP ' + res.status + ' — ' + body.slice(0, 160));
+                });
+              }
+              return res.json();
+            })
+            .then(function (styleJson) {
+              var layerCount = styleJson.layers ? styleJson.layers.length : 0;
+              var sourceCount = styleJson.sources ? Object.keys(styleJson.sources).length : 0;
+              hudLog('style layers=' + layerCount + ' sources=' + sourceCount);
+
+              map = new maplibregl.Map({
+                container: 'map',
+                style: styleJson,
+                center: [config.lng, config.lat],
+                zoom: config.zoom,
+                pitch: config.pitch,
+                bearing: config.bearing || 0,
+                attributionControl: false,
+                dragRotate: false,
+                touchPitch: false,
+                maxZoom: config.maxZoom || 18,
+                minZoom: config.minZoom || 0,
+                preserveDrawingBuffer: true,
+                fadeDuration: 0,
+                transformRequest: function (url, resourceType) {
+                  var out = rewrite(url, resourceType || '', key, proxyOrigin);
+                  if (DEBUG && resourceType === 'Tile') {
+                    if (!window.__tileLogs) window.__tileLogs = 0;
+                    if (window.__tileLogs < 3) {
+                      window.__tileLogs += 1;
+                      hudLog('tile → ' + out.slice(0, 90));
+                    }
+                  }
+                  return { url: out };
+                }
+              });
+
+              map.once('load', function () { ok('load'); });
+              map.once('idle', function () { ok('idle'); });
+              map.on('error', function (e) {
+                var message = e && e.error ? String(e.error.message || e.error) : 'Map error';
+                hudLog('map.error ' + message);
+                post({ type: 'error', message: message });
+              });
+              map.on('click', function (e) {
+                post({ type: 'mapPress', latitude: e.lngLat.lat, longitude: e.lngLat.lng });
+              });
+            })
+            .catch(function (err) {
+              fail('style fetch: ' + String(err && err.message ? err.message : err));
+            });
+        } catch (err) {
+          fail('exception: ' + String(err && err.message ? err.message : err));
+        }
+      };
+
+      hudLog('page ready RN=' + !!window.ReactNativeWebView);
+      post({ type: 'bridgeReady' });
+
+      // Auto-init from query (embed=1 from Android) or browser without RN
+      var shouldAuto = qs.get('embed') === '1' || !window.ReactNativeWebView;
+      if (shouldAuto) {
+        var cfg = {
+          styleUrl: qs.get('styleUrl') || 'https://geo.sabzevar.ir:7001/styles/style.json',
+          tileApiKey: qs.get('key') || 'pk_OLH4n87ddaRXbkFXZM_hWn9hTeoKqhRn',
+          lng: parseFloat(qs.get('lng') || '57.6819'),
+          lat: parseFloat(qs.get('lat') || '36.2126'),
+          zoom: parseFloat(qs.get('zoom') || '13'),
+          pitch: parseFloat(qs.get('pitch') || '60'),
+          bearing: parseFloat(qs.get('bearing') || '0'),
+          maxZoom: parseFloat(qs.get('maxZoom') || '18'),
+          minZoom: parseFloat(qs.get('minZoom') || '0'),
+          proxyOrigin: qs.get('proxyOrigin') || location.origin,
+          timeoutMs: parseInt(qs.get('timeoutMs') || '120000', 10)
+        };
+        hudLog('auto-init embed');
+        window.__initSabzevarMap(cfg);
+      }
+    })();
+  </script>
+</body>
+</html>
